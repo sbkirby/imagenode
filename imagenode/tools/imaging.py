@@ -13,6 +13,7 @@ import signal
 import logging
 import itertools
 import threading
+import multiprocessing
 from time import sleep
 from datetime import datetime
 from ast import literal_eval
@@ -21,7 +22,7 @@ import numpy as np
 import cv2
 import imutils
 from imutils.video import VideoStream
-# sys.path.insert(0, '../../imagezmq/imagezmq') # for testing
+import zmq  # needed to use zmq.LINGER in ImageNode.closall methods
 import imagezmq
 from tools.utils import interval_timer
 from tools.nodehealth import HealthMonitor
@@ -52,18 +53,30 @@ class ImageNode:
             ".jpg", self.tiny_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         self.tiny_jpg = jpg_buffer  # matching tiny blank jpeg
         self.jpeg_quality = 95
+        self.pid = os.getpid()  # get process ID of this program
 
         # open ZMQ link to imagehub
-        # use either of the formats below to specifiy address of display computer
-        # sender = imagezmq.ImageSender(connect_to='tcp://jeff-macbook:5555')
-        # self.sender = imagezmq.ImageSender(connect_to='tcp://192.168.1.190:5555')
         self.sender = imagezmq.ImageSender(connect_to=settings.hub_address)
+        self.sender.zmq_socket.setsockopt(zmq.LINGER, 0)  # prevents ZMQ hang on exit
 
-        self.send_frame = self.send_jpg_frame  # default send function is jpg
-        if settings.send_type == 'image':
-            self.send_frame = self.send_image_frame  # set send function to image
-        else:  # anything not spelled 'image' is set to jpg
-            self.send_frame = self.send_jpg_frame  # set send function to jpg
+        # If settings.REP_watcher is True, pick the send_frame function
+        #  that does time recording of each REQ and REP. Start REP_watcher
+        #  thread. Set up deques to track REQ and REP times.
+        self.patience = settings.patience  # how long to wait in seconds
+        if settings.send_type == 'image':  # set send function to image
+            if settings.REP_watcher:
+                self.send_frame = self.send_image_frame_REP_watcher
+            else:
+                self.send_frame = self.send_image_frame
+        else: # anything not spelled 'image' sets send function to jpg
+            if settings.REP_watcher:
+                self.send_frame = self.send_jpg_frame_REP_watcher
+            else:
+                self.send_frame = self.send_jpg_frame
+        if settings.REP_watcher:  # set up deques & start thread to watch for REP
+            threading.Thread(daemon=True, target=self.REP_watcher).start()
+            self.REQ_sent_time = deque(maxlen=1)
+            self.REP_recd_time = deque(maxlen=1)
 
         # set up message queue to hold (text, image) messages to be sent to hub
         if settings.send_threading:  # use a threaded send_q sender instead
@@ -138,6 +151,17 @@ class ImageNode:
         if settings.print_node:
             self.print_node_details(settings)
 
+        # send an imagenode startup event message with system values
+        text = '|'.join([settings.nodename,
+                        'Restart',
+                        self.health.hostname,
+                        self.health.sys_type,
+                        self.health.ipaddress,
+                        self.health.ram_size,
+                        self.health.time_since_restart])
+        text_and_image = (text, self.tiny_image)
+        self.send_q.append(text_and_image)
+
     def print_node_details(self, settings):
         print('Node details after setup and camera test read:')
         print('  Node name:', settings.nodename)
@@ -154,7 +178,7 @@ class ImageNode:
                     picamversion = require('picamera')[0].version
                 except:
                     picamversion = '0'
-                print('    PiCamera:')
+                print('    PiCamerax:')
                 # awb_mode: off, auto, sunlight, cloudy, shade, tungsten, fluorescent, incandescent, flash, horizon
                 print('        awb_mode:', cam.cam.camera.awb_mode, '(default = auto)')
                 print('        brightness:', cam.cam.camera.brightness, '(default = 50, integer between 0 and 100)')
@@ -199,21 +223,6 @@ class ImageNode:
                     print('      min_area:', detector.min_area_pixels, '(in pixels)')
                     print('      blur_kernel_size:', detector.blur_kernel_size)
                     print('      print_still_frames:', detector.print_still_frames)
-                elif detector.detector_type == 'object_detection':
-                    print('      home_dir:', detector.home_dir)
-                    print('      weights_path:', detector.weights_path)
-                    print('      config_path:', detector.config_path)
-                    print('      class_names:', detector.class_names)
-                    print('      score_threshold:', detector.score_threshold)
-                    print('      nms_threshold:', detector.nms_threshold)
-                    print('      conf_threshold:', detector.conf_threshold)
-                    print('      considered_names:', detector.considered_names)
-                    print('      draw_box:', detector.draw_box)
-                    print('      box_thickness:', detector.box_thickness)
-                    print('      box_color:', detector.box_color)
-                    print('      box_fontScale:', detector.box_fontScale)
-                    print('      box_fontColor:', detector.box_fontColor)
-                    print('      box_fontThickness:', detector.box_fontThickness)
         print()
 
     def setup_sensors(self, settings):
@@ -259,6 +268,39 @@ class ImageNode:
             cam = Camera(camera, settings.cameras, settings)  # create a Camera instance
             self.camlist.append(cam)  # add it to the list of cameras
 
+    def REP_watcher(self):
+        """ checks that a REP was received after a REQ; fix_comm_link() if not
+
+        When running in production, watching for a stalled ZMQ channel is required.
+        The REP_watcher yaml option enables checking that REP is received after REQ.
+
+        Runs in a thread; both REQ_sent_time & REP_recd_time are deque(maxlen=1).
+        Although REPs and REQs can be filling the deques continuously in the main
+        thread, we only need to occasionally check recent REQ / REP times. When
+        we have not received a timely REP after a REQ, we have a broken ZMQ
+        communications channel and call self.fix_comm_link().
+
+        """
+        while True:
+            sleep(self.patience)  # how often to check
+            try:
+                recent_REQ_sent_time = self.REQ_sent_time.popleft()
+                # if we got here; we have a recent_REQ_sent_time
+                sleep(1.0)  # allow time for receipt of a REP
+                try:
+                    recent_REP_recd_time = self.REP_recd_time.popleft()
+                except IndexError:  # there was a REQ, but no REP was received
+                    self.fix_comm_link()
+                # if we got here; we have a recent_REP_recd_time
+                interval = recent_REP_recd_time - recent_REQ_sent_time
+                if  interval.total_seconds() <= 0.0:
+                    # recent_REP_recd_time is not later than recent_REQ_sent_time
+                    self.fix_comm_link()
+            except IndexError: # there wasn't a time in REQ_sent_time
+                # so there is no REP expected,
+                # ... so continue to loop until there is a time in REQ_sent_time
+                pass
+
     def send_jpg_frame(self, text, image):
         """ Compresses image as jpg before sending
 
@@ -278,6 +320,50 @@ class ImageNode:
         """
 
         hub_reply = self.sender.send_image(text, image)
+        return hub_reply
+
+
+    def send_jpg_frame_REP_watcher(self, text, image):
+        """ Compresses image as jpg before sending; sends with RPI_watcher deques
+
+        Function self.send_frame() is set to this function if jpg option chosen
+        and if REP_watcher option is True. For each (text, jpg_buffer) that is
+        sent, the current time is appended to a deque before and after the send.
+        This allows comparing times to check if a REP has been received after
+        the (text, jpg_buffer) REQ has been set. See self.REP_watcher() method
+        for details.
+        """
+
+        ret_code, jpg_buffer = cv2.imencode(
+            ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY),
+            self.jpeg_quality])
+        self.REQ_sent_time.append(datetime.utcnow())  # utcnow 2x faster than now
+        try:
+            hub_reply = self.sender.send_jpg(text, jpg_buffer)
+        except:  # add more specific exception, e.g. ZMQError, after testing
+            print("Exception at sender.send_jpg in REP_watcher function.")
+            self. fix_comm_link()
+        self.REP_recd_time.append(datetime.utcnow())
+        return hub_reply
+
+    def send_image_frame_REP_watcher(self, text, image):
+        """ Sends uncompressed OpenCV image; sends with RPI_watcher deques
+
+        Function self.send_frame() is set to this function if image option chosen
+        and if REP_watcher option is True. For each (text, jpg_buffer) that is
+        sent, the current time is appended to a deque before and after the send.
+        This allows comparing times to check if a REP has been received after
+        the (text, jpg_buffer) REQ has been set. See self.REP_watcher() method
+        for details.
+        """
+
+        self.REQ_sent_time.append(datetime.utcnow())  # utcnow 2x faster than now
+        try:
+            hub_reply = self.sender.send_image(text, image)
+        except:  # add more specific exception, e.g. ZMQError, after testing
+            print("Exception at sender.send_image in REP_watcher function.")
+            self. fix_comm_link()
+        self.REP_recd_time.append(datetime.utcnow())
         return hub_reply
 
     def read_cameras(self):
@@ -334,21 +420,35 @@ class ImageNode:
     def fix_comm_link(self):
         """ Evaluate, repair and restart communications link with hub.
 
-        Restart link if possible, else restart program or reboot computer.
+        Perhaps in future: Close and restart imageZMQ if possible, else restart
+        program or reboot computer.
+
+        For now, just call a function that will cause imagenode.py to exit.
         """
-        # TODO add some of the ongoing experiments to this code when
-        #      have progressed in development and testing
-        # Currently in testing:
-        #     1. Just wait longer one time and try sending again:
-        #        hub_reply = node.send_frame(text, image) # again
-        #     2. Doing 1 repeatedly with exponential time increases
-        #     3. Stopping and closing ZMQ context; restarting and sending
-        #            last message
-        #     4. Check WiFi ping; stop and restart WiFi service
-        #     5. Reboot RPi; allow startup to restart imagenode.py
-        #
+        self.shutdown_imagenode()
         sys.exit()
-        return 'hub_reply'
+
+    def shutdown_imagenode(self):
+        """ Start a process that shuts down the imagenode.py program.
+
+        It is very difficult to shutdown the imagenode.py program from
+        within a thread since sys.exit() only exits the thread. And most other
+        techniques that will end a program immediately don't close resources
+        appropriately. But creating a subprocess that kills the imagenode.py
+        parent process works cleanly. There really should be an easier way to
+        end a Python program from a thread, but after lots of searching, this
+        works. And, yes, it is messy. Please find a better one and send a
+        pull request!
+
+        """
+        multiprocessing.Process(daemon=True,
+                   args=((self.pid,)),
+                   target=self.shutdown_process_by_pid).start()
+        sys.exit()
+
+    def shutdown_process_by_pid(self, pid):
+        os.kill(pid, signal.SIGTERM)
+        sys.exit()
 
     def process_hub_reply(self, hub_reply):
         """ Process hub reply if it is other than "OK".
@@ -386,6 +486,7 @@ class ImageNode:
             self.health.stall_p.join()
         if settings.send_threading:
             self.send_q.stop_sending()
+        self.sender.zmq_socket.setsockopt(zmq.LINGER, 0)  # prevents ZMQ hang on exit
         self.sender.close()
 
 
@@ -448,7 +549,6 @@ class SendQueue:
     def start(self):
         # start the thread to read frames from the video stream
         t = threading.Thread(target=self.send_messages_forever)
-        print('Starting threading')
         t.daemon = True
         t.start()
 
@@ -524,12 +624,14 @@ class Sensor:
             self.temp_sensor = W1ThermSensor()
 
         if (self.type == 'DHT11') or (self.type == 'DHT22'):
-            global adafruit_dht  # for DHT11 & DHT22 temperature sensor
+            global adafruit_dht, board  # for DHT11 & DHT22 temperature sensor
             import adafruit_dht
+            import board
+            board_pin = getattr(board, self.gpio)
             if self.type == 'DHT11':
-                self.temp_sensor = adafruit_dht.DHT11(self.gpio)
+                self.temp_sensor = adafruit_dht.DHT11(board_pin, use_pulseio=False)
             if self.type == 'DHT22':
-                self.temp_sensor = adafruit_dht.DHT22(self.gpio)
+                self.temp_sensor = adafruit_dht.DHT22(board_pin, use_pulseio=False)
 
         if self.temp_sensor is not None:
             self.check_temperature()  # check one time, then start interval_timer
@@ -756,8 +858,8 @@ class Camera:
                                  settings.nodename,
                                  self.viewname)
         if camera[0].lower() == 'p':  # this is a picam
-            # start PiCamera and warm up; inherits methods from VideoStream
-            # unless threaded_read is False; then uses class
+            # start PiCamera and warm up; inherits methods from
+            # imutils.VideoStream unless threaded_read is False; then uses class
             # PiCameraUnthreadedStream to read the PiCamera in an unthreaded way
             if self.threaded_read:
                 self.cam = VideoStream(usePiCamera=True,
@@ -894,56 +996,6 @@ class Detector:
                 self.print_still_frames = detectors[detector]['print_still_frames']
             else:
                 self.print_still_frames = True  # True is default print_still_frames
-        elif detector == 'object_detection':
-            self.detect_state = self.detect_objects
-            if 'home_dir' in detectors[detector]:
-                self.home_dir = detectors[detector]['home_dir']
-            else:
-                self.home_dir = os.path.expanduser("~")  # user home directory
-            if 'weights_path' in detectors[detector]:
-                self.weights_path = detectors[detector]['weights_path']
-            else:
-                self.weights_path = 'frozen_inference_graph.pb'  # weights path
-            if 'config_path' in detectors[detector]:
-                self.config_path = detectors[detector]['config_path']
-            else:
-                self.config_path = 'ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt'  # configuration path
-            if 'class_names' in detectors[detector]:
-                self.class_names = detectors[detector]['class_names']
-            else:
-                self.class_names = 'coco.names'  # file containing class names
-            if 'score_threshold' in detectors[detector]:
-                self.score_threshold = detectors[detector]['score_threshold']
-            else:
-                self.score_threshold = 0.45  # score threshold
-            if 'nms_threshold' in detectors[detector]:
-                self.nms_threshold = detectors[detector]['nms_threshold']
-            else:
-                self.nms_threshold = 0.2  # NMS threshold
-            if 'conf_threshold' in detectors[detector]:
-                self.conf_threshold = detectors[detector]['conf_threshold']
-            else:
-                self.conf_threshold = 0.5  # confidence threshold
-            if 'considered_names' in detectors[detector]:
-                self.considered_names = detectors[detector]['considered_names']
-            else:
-                # list of class names to consider
-                self.considered_names = ["bird", "dog", "cat",
-                                         "person", "car", "bicycle",
-                                         "bus", "motorbike", "truck"]
-            if 'draw_box' in detectors[detector]:
-                self.draw_box = literal_eval(detectors[detector]['draw_box'])
-                self.box_color = self.draw_box[0]
-                self.box_thickness = self.draw_box[1]
-            else:
-                self.draw_box = None
-            if 'box_font' in detectors[detector]:
-                self.box_font = literal_eval(detectors[detector]['box_font'])
-                self.box_fontColor = self.box_font[0]
-                self.box_fontScale = self.box_font[1]
-                self.box_fontThickness = self.box_font[2]
-            else:
-                self.box_font = None
 
         if 'ROI' in detectors[detector]:
             self.roi_pct = literal_eval(detectors[detector]['ROI'])
@@ -1005,22 +1057,6 @@ class Detector:
             self.send_test_images = detectors[detector]['send_test_images']
         else:
             self.send_test_images = False  # default is NOT to send test images
-
-        # init object detection - load model and config files
-        if detector == 'object_detection':
-            self.classNames = []
-            classFile = self.home_dir + self.class_names
-            with open(classFile, 'rt') as f:
-                self.classNames = f.read().rstrip('\n').split('\n')
-            configPath = self.home_dir + self.config_path
-            weightsPath = self.home_dir + self.weights_path
-            # Create detection model from network binary file of trained weights
-            # and text file of network configuration
-            self.dnn_net = cv2.dnn_DetectionModel(weightsPath, configPath)
-            self.dnn_net.setInputSize(320, 320)
-            self.dnn_net.setInputScale(1.0 / 127.5)
-            self.dnn_net.setInputMean((127.5, 127.5, 127.5))
-            self.dnn_net.setInputSwapRB(True)
 
         # self.event_text is the text message for this detector that is
         # sent when the detector state changes
@@ -1122,7 +1158,8 @@ class Detector:
         # if frame_count > 0, need to send send_count images from the cam_q
         #   by appending them to send_q
         if self.frame_count > 0:  # then need to send images of this event
-            send_count = min(len(camera.cam_q), self.send_count)
+            camq_len = len(camera.cam_q)
+            send_count = min(camq_len, self.send_count)
             for i in range(-send_count, -1):
                 text_and_image = (camera.text, camera.cam_q[i])
                 send_q.append(text_and_image)
@@ -1245,7 +1282,8 @@ class Detector:
         # if frame_count > 0, need to send send_count images from the cam_q
         #   by appending them to send_q
         if self.frame_count > 0:  # then need to send images of this event
-            send_count = min(len(camera.cam_q), self.send_count)
+            camq_len = len(camera.cam_q)
+            send_count = min(camq_len, self.send_count)
             if (self.current_state == 'still') and (self.print_still_frames is False):
                 send_count = 0
             for i in range(-send_count, -1):
@@ -1254,74 +1292,6 @@ class Detector:
 
         # Now that current state has been sent, it becomes the last_state
         self.last_state = self.current_state
-
-    def detect_objects(self, camera, image, send_q):
-        """ Detect if ROI is contains objects; send event message and images
-
-        After adding current image to 'event state' history queue, detect if the
-        ROI state has changed (e.g., has state changed to 'lighted' from 'dark'.)
-
-        If the state has changed, send an event message and the event images.
-        (However, if send_frames option is 'continuous', images have already
-        been sent, so there is no need to send the event images.)
-
-        If state has not changed, just store the image state into 'event state'
-        history queue for later comparison and return.
-
-        Parameters:
-            camera (Camera object): current camera
-            image (OpenCV image): current image
-            send_q (Deque): where (text, image) tuples are appended to be sent
-        """
-        # crop ROI
-        x1, y1 = self.top_left
-        x2, y2 = self.bottom_right
-        ROI = image[y1:y2, x1:x2]
-
-        # frame = cv2.imdecode(ROI, cv2.IMREAD_UNCHANGED)
-        classIds, confidences, bbox = self.dnn_net.detect(ROI, confThreshold=self.conf_threshold)
-
-        bbox = list(bbox)
-        confidences = list(np.array(confidences).reshape(1, -1)[0])
-        confidences = list(map(float, confidences))
-        # initialize each object to zero in objCount dictionary
-        objCount = {obj: 0 for obj in self.considered_names}
-
-        # Performs non maximum suppression (NMS) given boxes and corresponding scores
-        indices = cv2.dnn.NMSBoxes(bbox, confidences, self.score_threshold, self.nms_threshold)
-
-        for i in indices:
-            i = i[0]
-            if self.draw_box:
-                box = bbox[i]
-                x, y, w, h = box[0], box[1], box[2], box[3]
-            if len(classIds) != 0:
-                if self.classNames[classIds[i][0] - 1] in self.considered_names:
-                    # increment the count of each "considered" object
-                    objCount[self.classNames[classIds[i][0] - 1]] += 1
-                    # draw box
-                    if self.draw_box:
-                        cv2.rectangle(image, (x + x1, y + y1), (w + x + x1, h + y + y1),
-                                      color=self.box_color,
-                                      thickness=self.box_thickness)
-                    # write label
-                    if self.box_font:
-                        text = "{}: {:.4f}".format(self.classNames[classIds[i][0] - 1].lower(), confidences[i])
-                        cv2.putText(image, text,
-                                    (x + x1 + 10, y + y1 + 30),
-                                    cv2.FONT_HERSHEY_COMPLEX,
-                                    self.box_fontScale,
-                                    self.box_fontColor,
-                                    self.box_fontThickness)
-
-        if sum(objCount.values()) > 0:
-            # log event
-            text = '|'.join([self.event_text, 'object'])
-            text_and_image = (text, self.msg_image)
-            send_q.append(text_and_image)
-            # send image
-            text_and_image = (camera.text, image)
-            send_q.append(text_and_image)
 
     def send_test_data(self, images, state_values, send_q):
         """ Sends various test data, images, computed state values via send_q
@@ -1404,11 +1374,15 @@ class Settings:
         if 'heartbeat' in self.config['node']:
             self.heartbeat = self.config['node']['heartbeat']
         else:
-            self.heartbeat = 0
+            self.heartbeat = None
         if 'stall_watcher' in self.config['node']:
             self.stall_watcher = self.config['node']['stall_watcher']
         else:
             self.stall_watcher = False
+        if 'REP_watcher' in self.config['node']:
+            self.REP_watcher = self.config['node']['REP_watcher']
+        else:
+            self.REP_watcher = True
         if 'send_threading' in self.config['node']:
             self.send_threading = self.config['node']['send_threading']
         else:
