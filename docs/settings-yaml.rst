@@ -815,7 +815,7 @@ sensors such as PIR (passive infrared) sensors for motion detection. That code
 will be added to the repository when it has been more thoroughly tested. Sensors
 use the RPi.GPIO module and can only be run on Raspberry Pi computers.
 
-There are 5 options to set when using DS18B20 or DHT22 sensors:
+There are 5 options to set when using DS18B20, DHT11 or DHT22 sensors:
 
 .. code-block:: yaml
 
@@ -829,19 +829,30 @@ There are 5 options to set when using DS18B20 or DHT22 sensors:
     T2:
       name: Temperature & Humidity
       type: DHT22
-      gpio: 18
+      gpio: D4
       read_interval_minutes: 10  # check temperature every X minutes
       min_difference: 1  # send reading when changed by X degrees
 
 
-1. name: This is a descriptive name for the sensor.
-2. type: DS18B20, DHT11 and DHT22 are the currently supported sensors.
-3. gpio: Which GPIO pin reads the sensor. Pin 4 must be
+1. **name**: This is a descriptive name for the sensor.
+2. **type**: DS18B20, DHT11 and DHT22 are the currently supported sensors.
+3. **gpio**: Which GPIO pin reads the sensor. Pin 4 must be
    used for "one-wire" sensors like the DS18B20. Any GPIO pin can be used for
-   DHT11 or DHT22 sensors.
-4. read_interval_minutes: How often the sensor measurements should be read,
+   DHT11 or DHT22 sensors, but the pin should be defined as those listed in ``dir(board)``::
+
+   >>> import board
+   >>>
+   >>> dir(board)
+      ['CE0', 'CE1', 'D0', 'D1', 'D10', 'D11', 'D12', 'D13', 'D14', 'D15', 'D16', 'D17', 'D18', 
+      'D19', 'D2', 'D20', 'D21', 'D22', 'D23', 'D24', 'D25', 'D26', 'D27', 'D3', 'D4', 'D5', 
+      'D6', 'D7', 'D8', 'D9', 'I2C', 'MISO', 'MISO_1', 'MOSI', 'MOSI_1', 'RX', 'RXD', 'SCK', 
+      'SCK_1', 'SCL', 'SCLK', 'SCLK_1', 'SDA', 'SPI', 'TX', 'TXD', '__builtins__', '__cached__', 
+      '__doc__', '__file__', '__loader__', '__name__', '__package__', '__spec__', 'ap_board', 
+      'board_id', 'detector', 'pin', 'sys']
+
+4. **read_interval_minutes**: How often the sensor measurements should be read,
    specified in minutes
-5. min_difference: The minimum change from the last reading that
+5. **min_difference**: The minimum change from the last reading that
    will cause an event message to be sent to the hub. Typically set to 1 or 2
    degrees. The setting will apply to humidity minimum change on DHT11 or DHT22
    sensors.
